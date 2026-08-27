@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark light" />
+  <title>MIRRORZ PDF Editor</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%236c5ce7'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='bold' text-anchor='middle' fill='white'%3EM%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="tb-group brand">
+        <span class="logo">MIRRORZ</span><span class="logo-sub">PDF</span>
+      </div>
+      <div class="tb-group">
+        <button id="btnOpen" class="tb-btn" title="Open PDF, image or text file (Ctrl+O)"></button>
+        <button id="btnSave" class="tb-btn" title="Save PDF (Ctrl+S)"></button>
+        <div class="dropdown">
+          <button id="btnSaveMenu" class="tb-btn caret" title="Save options"></button>
+          <div class="menu" id="saveMenu" hidden>
+            <button data-save="annots">Save with editable annotations</button>
+            <button data-save="flatten">Save flattened (burn-in annotations)</button>
+            <button data-save="optimize">Save optimized (smaller file)</button>
+          </div>
+        </div>
+        <button id="btnPrint" class="tb-btn" title="Print (Ctrl+P)"></button>
+      </div>
+      <div class="tb-group">
+        <button id="btnUndo" class="tb-btn" title="Undo (Ctrl+Z)" disabled></button>
+        <button id="btnRedo" class="tb-btn" title="Redo (Ctrl+Y)" disabled></button>
+      </div>
+      <div class="tb-group tools" id="toolGroup">
+        <button class="tb-btn tool active" data-tool="select" title="Select / edit annotations (V)"></button>
+        <button class="tb-btn tool" data-tool="hand" title="Hand / pan (H)"></button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn tool" data-tool="highlight" title="Highlight text (Shift+H)"></button>
+        <button class="tb-btn tool" data-tool="underline" title="Underline text (U)"></button>
+        <button class="tb-btn tool" data-tool="strikeout" title="Strike out text (K)"></button>
+        <button class="tb-btn tool" data-tool="note" title="Sticky note (N)"></button>
+        <button class="tb-btn tool" data-tool="text" title="Add text (T)"></button>
+        <button class="tb-btn tool" data-tool="ink" title="Draw freehand (D)"></button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn tool" data-tool="rect" title="Rectangle (R)"></button>
+        <button class="tb-btn tool" data-tool="ellipse" title="Ellipse (E)"></button>
+        <button class="tb-btn tool" data-tool="line" title="Line (L)"></button>
+        <button class="tb-btn tool" data-tool="arrow" title="Arrow (A)"></button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn tool" data-tool="whiteout" title="Whiteout / cover content (W)"></button>
+        <button class="tb-btn tool" data-tool="signature" title="Sign (S)"></button>
+        <button class="tb-btn tool" data-tool="stamp" title="Stamp"></button>
+        <button class="tb-btn tool" data-tool="image" title="Place image"></button>
+      </div>
+      <div class="tb-group props">
+        <input type="color" id="propColor" value="#ffd400" title="Color" />
+        <select id="propWidth" title="Stroke width">
+          <option value="1">1 pt</option>
+          <option value="2" selected>2 pt</option>
+          <option value="3">3 pt</option>
+          <option value="5">5 pt</option>
+          <option value="8">8 pt</option>
+          <option value="12">12 pt</option>
+        </select>
+        <select id="propOpacity" title="Opacity">
+          <option value="1" selected>100%</option>
+          <option value="0.75">75%</option>
+          <option value="0.5">50%</option>
+          <option value="0.4">40%</option>
+          <option value="0.25">25%</option>
+        </select>
+        <select id="propFontSize" title="Font size" hidden>
+          <option>10</option><option>12</option><option selected>14</option>
+          <option>18</option><option>24</option><option>36</option><option>48</option>
+        </select>
+      </div>
+      <div class="tb-spacer"></div>
+      <div class="tb-group">
+        <button id="btnZoomOut" class="tb-btn" title="Zoom out (-)"></button>
+        <select id="zoomSelect" title="Zoom level">
+          <option value="fit-width">Fit width</option>
+          <option value="fit-page">Fit page</option>
+          <option value="0.5">50%</option>
+          <option value="0.75">75%</option>
+          <option value="1" selected>100%</option>
+          <option value="1.25">125%</option>
+          <option value="1.5">150%</option>
+          <option value="2">200%</option>
+          <option value="3">300%</option>
+          <option value="4">400%</option>
+        </select>
+        <button id="btnZoomIn" class="tb-btn" title="Zoom in (+)"></button>
+      </div>
+      <div class="tb-group">
+        <input type="number" id="pageNum" min="1" value="1" title="Current page" />
+        <span id="pageCount" class="page-count">/ 0</span>
+      </div>
+      <div class="tb-group">
+        <button id="btnSearch" class="tb-btn" title="Search (Ctrl+F)"></button>
+        <button id="btnOrganize" class="tb-btn" title="Organize pages"></button>
+        <button id="btnTheme" class="tb-btn" title="Toggle dark / light theme"></button>
+        <div class="dropdown">
+          <button id="btnMore" class="tb-btn" title="More"></button>
+          <div class="menu right" id="moreMenu" hidden>
+            <button id="miMerge">Merge PDFs into this document…</button>
+            <button id="miWatermark">Watermark &amp; page numbers…</button>
+            <button id="miMeta">Document properties…</button>
+            <button id="miComments">Export comments summary</button>
+            <hr />
+            <button id="miShortcuts">Keyboard shortcuts</button>
+            <button id="miUpgrade">Pricing &amp; premium</button>
+            <button id="miAbout">About MIRRORZ</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <div id="searchbar" hidden>
+      <input type="text" id="searchInput" placeholder="Search in document…" />
+      <span id="searchCount"></span>
+      <button id="searchPrev" title="Previous match">▲</button>
+      <button id="searchNext" title="Next match">▼</button>
+      <button id="searchClose" title="Close">✕</button>
+    </div>
+
+    <div id="body">
+      <aside id="sidebar">
+        <div class="side-tabs">
+          <button class="side-tab active" data-panel="thumbs" title="Page thumbnails"></button>
+          <button class="side-tab" data-panel="outline" title="Outline / bookmarks"></button>
+          <button class="side-tab" data-panel="comments" title="Comments list"></button>
+          <button class="side-tab" data-panel="forms" title="Form fields"></button>
+        </div>
+        <div class="side-panels">
+          <div class="side-panel active" id="panel-thumbs"></div>
+          <div class="side-panel" id="panel-outline"><p class="empty">No outline in this document.</p></div>
+          <div class="side-panel" id="panel-comments"><p class="empty">No comments yet.</p></div>
+          <div class="side-panel" id="panel-forms"><p class="empty">No form fields found.</p></div>
+        </div>
+      </aside>
+
+      <main id="viewerWrap" tabindex="0">
+        <div id="welcome">
+          <div class="welcome-card">
+            <h1><span class="logo big">MIRRORZ</span> PDF Editor</h1>
+            <p class="tagline">Fast, private, offline. Your files never leave this device.</p>
+            <button id="btnOpenWelcome" class="cta">Open a PDF</button>
+            <p class="hint">…or drop a PDF, image (PNG/JPG) or text file anywhere in this window.
+              Images and text files are converted to PDF automatically.</p>
+            <div id="recentFiles" hidden>
+              <h3>Recent files <span class="muted">(stored only on this device)</span></h3>
+              <ul id="recentList"></ul>
+            </div>
+            <ul class="welcome-points">
+              <li>100% offline &amp; private — no uploads, no account, no tracking</li>
+              <li>No watermarks, no file-size limits, no page limits</li>
+              <li>Annotations save as real PDF annotations, editable anywhere</li>
+              <li>Instant startup — the whole app is a single lightweight page</li>
+            </ul>
+          </div>
+        </div>
+        <div id="viewer" hidden></div>
+      </main>
+    </div>
+
+    <div id="organizer" hidden>
+      <div class="org-head">
+        <h2>Organize pages</h2>
+        <span class="muted">Drag to reorder • click to select (Ctrl/Shift for multi-select)</span>
+        <div class="org-actions">
+          <button id="orgRotateL" title="Rotate selected left">⟲ Rotate</button>
+          <button id="orgRotateR" title="Rotate selected right">⟳ Rotate</button>
+          <button id="orgDuplicate">Duplicate</button>
+          <button id="orgDelete" class="danger">Delete</button>
+          <button id="orgExtract">Extract selected → new PDF</button>
+          <button id="orgBlank">+ Blank page</button>
+          <button id="orgClose" class="primary">Done</button>
+        </div>
+      </div>
+      <div class="org-grid" id="orgGrid"></div>
+    </div>
+
+    <div id="toast" hidden></div>
+    <div id="dropHint" hidden><div>Drop file to open</div></div>
+  </div>
+
+  <dialog id="dlgMeta">
+    <h2>Document properties</h2>
+    <form method="dialog" id="metaForm">
+      <label>Title <input name="title" /></label>
+      <label>Author <input name="author" /></label>
+      <label>Subject <input name="subject" /></label>
+      <label>Keywords <input name="keywords" /></label>
+      <div class="dlg-info" id="metaInfo"></div>
+      <div class="dlg-actions">
+        <button value="cancel">Cancel</button>
+        <button value="ok" class="primary">Apply to saved file</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlgWatermark">
+    <h2>Watermark &amp; page numbers</h2>
+    <form method="dialog" id="wmForm">
+      <label>Watermark text <input name="text" placeholder="e.g. DRAFT — leave empty for none" /></label>
+      <label>Size <select name="size"><option>24</option><option selected>48</option><option>72</option></select></label>
+      <label>Opacity <select name="opacity"><option>0.1</option><option selected>0.2</option><option>0.4</option></select></label>
+      <label>Color <input type="color" name="color" value="#d63031" /></label>
+      <label class="check"><input type="checkbox" name="diagonal" checked /> Diagonal</label>
+      <label class="check"><input type="checkbox" name="pagenums" /> Add page numbers (bottom center)</label>
+      <div class="dlg-actions">
+        <button value="cancel">Cancel</button>
+        <button value="ok" class="primary">Apply to saved file</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlgSignature">
+    <h2>Sign</h2>
+    <div class="sig-tabs">
+      <button id="sigTabDraw" class="active">Draw</button>
+      <button id="sigTabType">Type</button>
+    </div>
+    <div id="sigDrawPane">
+      <canvas id="sigCanvas" width="480" height="180"></canvas>
+      <button id="sigClear" type="button">Clear</button>
+    </div>
+    <div id="sigTypePane" hidden>
+      <input type="text" id="sigTypeInput" placeholder="Type your name" />
+      <div id="sigTypePreview" class="sig-preview"></div>
+    </div>
+    <label>Ink color <input type="color" id="sigColor" value="#1a237e" /></label>
+    <div class="dlg-actions">
+      <button id="sigCancel">Cancel</button>
+      <button id="sigOk" class="primary">Place signature</button>
+    </div>
+  </dialog>
+
+  <dialog id="dlgStamp">
+    <h2>Stamp</h2>
+    <div class="stamp-grid" id="stampGrid"></div>
+    <div class="dlg-actions"><button id="stampCancel">Cancel</button></div>
+  </dialog>
+
+  <dialog id="dlgUpgrade">
+    <h2>MIRRORZ pricing</h2>
+    <p class="muted">Everything you're using right now is <strong>free, offline and unlimited</strong> for personal use — that's a promise, not a trial.</p>
+    <div id="pricingCards" class="pricing-cards"></div>
+    <p class="muted" id="pricingFootnote"></p>
+    <div class="dlg-actions"><button id="upgradeClose" class="primary">Close</button></div>
+  </dialog>
+
+  <dialog id="dlgShortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <div class="shortcut-cols" id="shortcutList"></div>
+    <div class="dlg-actions"><button id="shortcutsClose" class="primary">Close</button></div>
+  </dialog>
+
+  <dialog id="dlgAbout">
+    <h2>About MIRRORZ PDF Editor</h2>
+    <div id="aboutBody"></div>
+    <div class="dlg-actions"><button id="aboutClose" class="primary">Close</button></div>
+  </dialog>
+
+  <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.webp,.txt,.md,application/pdf,image/png,image/jpeg,image/webp,text/plain" multiple hidden />
+  <input type="file" id="mergeInput" accept=".pdf,application/pdf" multiple hidden />
+  <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp" hidden />
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
