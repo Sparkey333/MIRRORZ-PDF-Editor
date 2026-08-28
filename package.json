@@ -1,0 +1,39 @@
+{
+  "name": "mirrorz-pdf-editor",
+  "version": "0.1.0",
+  "description": "MIRRORZ PDF Editor — offline-first PDF viewer, annotator and editor",
+  "main": "index.js",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "vite",
+    "build": "vite build",
+    "build:single": "MIRRORZ_SINGLE=1 vite build && mkdir -p downloads && cp dist-single/index.html downloads/MIRRORZ-PDF-Editor-offline.html",
+    "test:e2e": "playwright test",
+    "preview": "vite preview",
+    "prebuild": "node scripts/copy-pdfjs-assets.mjs",
+    "predev": "node scripts/copy-pdfjs-assets.mjs",
+    "prebuild:single": "node scripts/copy-pdfjs-assets.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sparkey333/MIRRORZ-PDF-Editor.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/Sparkey333/MIRRORZ-PDF-Editor/issues"
+  },
+  "homepage": "https://github.com/Sparkey333/MIRRORZ-PDF-Editor#readme",
+  "type": "module",
+  "dependencies": {
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.2.108"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "vite": "^8.2.2",
+    "vite-plugin-singlefile": "^2.3.3",
+    "vitest": "^4.1.11"
+  }
+}

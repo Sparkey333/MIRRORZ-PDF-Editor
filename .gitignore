@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-single/
+public/pdfjs/
+test-results/
+playwright-report/
+.vite/
