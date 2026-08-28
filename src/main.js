@@ -6,7 +6,7 @@
 import './styles.css';
 import { Store } from './store.js';
 import { loadPdf, renderPage, renderTextLayer, extractPageText, findMatches, getOutline, resolveDest } from './engine.js';
-import { fileToPdfBytes, importAnnotations, stripManagedAnnotations, listFormFields, exportPdf } from './pdfio.js';
+import { fileToPdfBytes, importAnnotations, stripManagedAnnotations, listFormFields, exportPdf, FORM_KEY_SEP } from './pdfio.js';
 import { pageMatrix, applyMatrix, invertMatrix, renderAnnotLayer, hitTest, movePatch, annotBounds, annotTypeLabel } from './overlay.js';
 import { applyIcon } from './icons.js';
 import { PRICING } from './pricing.js';
@@ -96,7 +96,7 @@ function blankViewport(entry, scale) {
   else if (rot === 180) { transform = [-s, 0, 0, s, w * s, 0]; W = w * s; H = h * s; }
   else if (rot === 270) { transform = [0, -s, -s, 0, h * s, w * s]; W = h * s; H = w * s; }
   else { transform = [s, 0, 0, -s, 0, h * s]; W = w * s; H = h * s; }
-  return { width: W, height: H, transform, viewBox: [0, 0, w, h] };
+  return { width: W, height: H, transform, rotation: rot, viewBox: [0, 0, w, h] };
 }
 
 function entryView(entry, proxy) {
@@ -108,6 +108,7 @@ function entryView(entry, proxy) {
 // ---------------------------------------------------------------------------
 
 let observer = null;
+let rebuildGen = 0; // aborts a rebuild that a newer rebuild has superseded
 
 async function computeScale() {
   if (typeof view.zoomMode === 'number') { view.scale = view.zoomMode; return; }
@@ -128,10 +129,13 @@ async function computeScale() {
 }
 
 async function rebuildViewer({ preserveScroll = true } = {}) {
+  const gen = ++rebuildGen;
+  closeInlineEditors(true);
   const wrap = els.viewerWrap;
   const ratio = wrap.scrollHeight > 0 ? wrap.scrollTop / wrap.scrollHeight : 0;
   observer?.disconnect();
   await computeScale();
+  if (gen !== rebuildGen) return; // a newer rebuild took over
   els.viewer.textContent = '';
   if (!store.hasDocument) {
     els.viewer.hidden = true;
@@ -148,17 +152,23 @@ async function rebuildViewer({ preserveScroll = true } = {}) {
     for (const e of entries) if (e.isIntersecting) renderPageEl(e.target);
   }, { root: wrap, rootMargin: '600px 0px' });
 
+  const frag = document.createDocumentFragment();
+  const pageEls = [];
   for (const entry of store.state.pages) {
     const d = await baseDims(entry);
+    if (gen !== rebuildGen) return;
     const el = document.createElement('div');
     el.className = 'page';
     el.dataset.pageId = entry.id;
     el.style.width = `${Math.floor(d.w * view.scale)}px`;
     el.style.height = `${Math.floor(d.h * view.scale)}px`;
     el.innerHTML = '<div class="loading">…</div>';
-    els.viewer.appendChild(el);
-    observer.observe(el);
+    frag.appendChild(el);
+    pageEls.push(el);
   }
+  if (gen !== rebuildGen) return;
+  els.viewer.appendChild(frag);
+  for (const el of pageEls) observer.observe(el);
   if (preserveScroll) wrap.scrollTop = ratio * wrap.scrollHeight;
   renderThumbs();
 }
@@ -254,9 +264,9 @@ function refreshAllAnnotLayers() {
 const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
 
 function setZoom(mode) {
+  if (typeof mode === 'number') mode = clamp(mode, 0.1, 6);
   view.zoomMode = mode;
-  if (typeof mode === 'number') els.zoomSelect.value = String(mode);
-  else els.zoomSelect.value = mode;
+  els.zoomSelect.value = String(mode);
   rebuildViewer();
 }
 
@@ -409,10 +419,15 @@ function renderComments() {
 async function renderFormsPanel() {
   const panel = $('#panel-forms');
   panel.innerHTML = '<p class="empty">No form fields found.</p>';
+  // only sources that still have pages in the composition — values for removed
+  // sources would silently never reach a saved file
+  const activeDocIds = new Set(store.state.pages.map((p) => p.docId).filter(Boolean));
   const fields = [];
-  for (const [docId, src] of store.sources) {
+  for (const docId of activeDocIds) {
+    const src = store.sources.get(docId);
+    if (!src) continue;
     const fs = await listFormFields(src.bytes);
-    for (const f of fs) fields.push({ ...f, docId });
+    for (const f of fs) fields.push({ ...f, docId, srcName: src.name });
   }
   if (!fields.length) return;
   panel.textContent = '';
@@ -420,28 +435,32 @@ async function renderFormsPanel() {
   info.className = 'muted';
   info.textContent = 'Values are written into the PDF when you save. Use “Save flattened” to make them permanent.';
   panel.appendChild(info);
+  const multiSource = activeDocIds.size > 1;
   for (const f of fields) {
+    // scope each value to its source document so merged files with identical
+    // field names don't clobber each other
+    const key = `${f.docId}${FORM_KEY_SEP}${f.name}`;
     const div = document.createElement('div');
     div.className = 'form-field';
     const label = document.createElement('label');
-    label.textContent = f.name;
+    label.textContent = multiSource ? `${f.name} — ${f.srcName}` : f.name;
     div.appendChild(label);
     let input;
     if (f.type === 'checkbox') {
       input = document.createElement('input');
       input.type = 'checkbox';
-      input.checked = !!(store.formValues[f.name] ?? f.value);
-      input.addEventListener('change', () => { store.formValues[f.name] = input.checked; store.dirty = true; });
+      input.checked = !!(store.formValues[key] ?? f.value);
+      input.addEventListener('change', () => { store.formValues[key] = input.checked; store.dirty = true; });
     } else if (f.type === 'radio' || f.type === 'dropdown' || f.type === 'optionlist') {
       input = document.createElement('select');
       input.innerHTML = '<option value=""></option>' +
-        (f.options || []).map((o) => `<option${(store.formValues[f.name] ?? f.value) === o ? ' selected' : ''}>${escapeHtml(o)}</option>`).join('');
-      input.addEventListener('change', () => { store.formValues[f.name] = input.value; store.dirty = true; });
+        (f.options || []).map((o) => `<option${(store.formValues[key] ?? f.value) === o ? ' selected' : ''}>${escapeHtml(o)}</option>`).join('');
+      input.addEventListener('change', () => { store.formValues[key] = input.value; store.dirty = true; });
     } else {
       input = document.createElement('input');
       input.type = 'text';
-      input.value = String(store.formValues[f.name] ?? f.value ?? '');
-      input.addEventListener('input', () => { store.formValues[f.name] = input.value; store.dirty = true; });
+      input.value = String(store.formValues[key] ?? f.value ?? '');
+      input.addEventListener('input', () => { store.formValues[key] = input.value; store.dirty = true; });
     }
     div.appendChild(input);
     panel.appendChild(div);
@@ -451,7 +470,7 @@ async function renderFormsPanel() {
   const clearBtn = document.createElement('button');
   clearBtn.className = 'secondary';
   clearBtn.textContent = 'Clear values';
-  clearBtn.addEventListener('click', () => { store.formValues = {}; renderFormsPanel(); });
+  clearBtn.addEventListener('click', () => { store.formValues = Object.create(null); renderFormsPanel(); });
   actions.appendChild(clearBtn);
   panel.appendChild(actions);
 }
@@ -468,48 +487,61 @@ function askPassword(reason) {
 async function openFiles(files, { append = false } = {}) {
   const list = [...files];
   if (!list.length) return;
-  try {
-    let first = !append || !store.hasDocument;
-    for (const file of list) {
+  let first = !append || !store.hasDocument;
+  let opened = 0;
+  const failures = [];
+  for (const file of list) {
+    // one bad file must not abort the rest, and never leaves the UI desynced
+    try {
       const { bytes, name } = await fileToPdfBytes(file);
       await addDocument(bytes, name, { fresh: first });
       first = false;
+      opened += 1;
+    } catch (err) {
+      console.error(err);
+      failures.push(`${file.name}: ${err.message}`);
     }
-    await afterCompositionChange({ fresh: !append });
-    if (list.length > 1) toast(`Merged ${list.length} files into one document`);
-  } catch (err) {
-    console.error(err);
-    toast(`Could not open file: ${err.message}`, true);
   }
+  if (opened > 0) await afterCompositionChange({ fresh: !append });
+  if (failures.length) toast(`Could not open ${failures.join('; ')}`, true);
+  else if (list.length > 1) toast(`Merged ${list.length} files into one document`);
 }
 
 async function addDocument(bytes, name, { fresh }) {
+  const originalBytes = bytes;
   let pdf = await loadPdf(bytes, askPassword);
   const docId = uid('d');
   const pageIds = Array.from({ length: pdf.numPages }, () => uid('p'));
 
   // Import existing markup annotations so they become editable, then strip
-  // them from the working bytes so they aren't rendered twice.
+  // exactly those from the working bytes so they aren't rendered twice.
   let annots = [];
   try {
-    annots = await importAnnotations(pdf, pageIds);
+    annots = await importAnnotations(pdf, pageIds, bytes);
   } catch (e) { console.warn('annot import failed', e); }
   if (annots.length) {
-    const cleaned = await stripManagedAnnotations(bytes);
+    const refSet = new Set(annots.map((a) => a.srcRef).filter(Boolean));
+    const cleaned = await stripManagedAnnotations(bytes, refSet);
     if (cleaned) {
       bytes = cleaned;
+      const preStrip = pdf;
       pdf = await loadPdf(bytes, askPassword);
+      preStrip.destroy?.().catch?.(() => {});
     } else {
       annots = []; // couldn't rewrite (encrypted?) — leave them baked in
     }
   }
 
   if (fresh) {
+    // release the previous document's pdf.js resources (worker-side memory)
+    for (const src of store.sources.values()) {
+      try { src.pdf?.destroy?.(); } catch { /* already gone */ }
+    }
     store.reset();
     view.textCache.clear();
     view.pageProxyCache.clear();
     view.selected = null;
-    view.search = { query: '', results: [], current: -1 };
+    clearSearchResults();
     store.fileName = name;
   } else {
     store.pushUndo();
@@ -520,7 +552,9 @@ async function addDocument(bytes, name, { fresh }) {
   });
   store.state.annotations.push(...annots);
   if (annots.length) toast(`Imported ${annots.length} existing annotation${annots.length > 1 ? 's' : ''} for editing`);
-  if (fresh) saveRecent(name, store.sources.get(docId).bytes);
+  // recents must keep the ORIGINAL bytes — the working copy has imported
+  // annotations stripped out of it
+  if (fresh) saveRecent(name, originalBytes);
 }
 
 async function afterCompositionChange({ fresh = false } = {}) {
@@ -529,6 +563,7 @@ async function afterCompositionChange({ fresh = false } = {}) {
   renderOutline();
   renderComments();
   renderFormsPanel();
+  if (!$('#organizer').hidden) { orgSel.clear(); renderOrganizer(); }
   updateUndoButtons();
 }
 
@@ -542,12 +577,19 @@ store.subscribe((evt) => {
     renderComments();
   } else if (evt.type === 'pages' || evt.type === 'restore') {
     view.selected = null;
+    clearSearchResults(); // page indices in results are stale now
     rebuildViewer();
     renderComments();
     if (!$('#organizer').hidden) renderOrganizer();
   }
   updateUndoButtons();
 });
+
+function clearSearchResults() {
+  view.search = { query: '', results: [], current: -1 };
+  $('#searchCount').textContent = '';
+  $$('#viewer .searchLayer').forEach((l) => { l.textContent = ''; });
+}
 
 function updateUndoButtons() {
   $('#btnUndo').disabled = !store.canUndo;
@@ -607,8 +649,9 @@ els.viewerWrap.addEventListener('pointerdown', (evt) => {
     if (handle && view.selected) {
       const a = annots.find((x) => x.id === view.selected);
       if (a) {
-        store.pushUndo();
-        drag = { kind: 'resize', handle: handle.dataset.handle, a, pt, start: JSON.parse(JSON.stringify(a)) };
+        // undo is pushed lazily on the first real movement, so a click that
+        // never drags leaves history (and the redo stack) untouched
+        drag = { kind: 'resize', handle: handle.dataset.handle, a, undoPushed: false };
         els.viewerWrap.setPointerCapture(evt.pointerId);
         evt.preventDefault();
         return;
@@ -620,8 +663,7 @@ els.viewerWrap.addEventListener('pointerdown', (evt) => {
       view.selected = hit.id;
       updateAnnotLayer(pt.pageId);
       refreshOtherLayers(pt.pageId);
-      store.pushUndo();
-      drag = { kind: 'move', a: hit, pageId: pt.pageId, lx: pt.x, ly: pt.y, moved: false };
+      drag = { kind: 'move', a: hit, pageId: pt.pageId, lx: pt.x, ly: pt.y, undoPushed: false };
       els.viewerWrap.setPointerCapture(evt.pointerId);
       evt.preventDefault();
     } else if (view.selected) {
@@ -636,7 +678,7 @@ els.viewerWrap.addEventListener('pointerdown', (evt) => {
       pageId: pt.pageId, type: 'note', x: pt.x - 11, y: pt.y - 10,
       color: view.props.color, opacity: 1, text: '',
     });
-    openNoteEditor(a, pt.el);
+    openNoteEditor(a, pt.el, { isNew: true });
     return;
   }
 
@@ -648,7 +690,7 @@ els.viewerWrap.addEventListener('pointerdown', (evt) => {
       color: view.props.color === '#ffd400' ? '#d63031' : view.props.color,
       opacity: 1, text: '', fontSize: fs,
     });
-    openFreetextEditor(a, pt.el);
+    openFreetextEditor(a, pt.el, { isNew: true });
     return;
   }
 
@@ -684,11 +726,12 @@ els.viewerWrap.addEventListener('pointermove', (evt) => {
     if (drag.kind === 'move') {
       const dx = p.x - drag.lx, dy = p.y - drag.ly;
       if (Math.abs(dx) + Math.abs(dy) > 0.01) {
-        drag.moved = true;
+        if (!drag.undoPushed) { store.pushUndo(); drag.undoPushed = true; }
         store.updateAnnotation(drag.a.id, movePatch(drag.a, dx, dy), { skipUndo: true });
         drag.lx = p.x; drag.ly = p.y;
       }
     } else {
+      if (!drag.undoPushed) { store.pushUndo(); drag.undoPushed = true; }
       applyResize(drag, p);
     }
     return;
@@ -716,16 +759,7 @@ els.viewerWrap.addEventListener('pointerup', (evt) => {
   els.viewerWrap.classList.remove('panning');
   clearDragPreview();
   if (d.kind === 'pan') return;
-  if (d.kind === 'move') {
-    if (!d.moved) {
-      // simple click on an annotation: pop the undo we pushed
-      store.undoStack.pop();
-      updateUndoButtons();
-      // double-click editing handled via dblclick
-    }
-    return;
-  }
-  if (d.kind === 'resize') return;
+  if (d.kind === 'move' || d.kind === 'resize') return; // undo handled lazily
 
   if (d.kind === 'ink') {
     if (d.points.length > 1) {
@@ -756,6 +790,15 @@ els.viewerWrap.addEventListener('pointerup', (evt) => {
       strokeWidth: view.props.width,
     });
   }
+});
+
+// A cancelled pointer (browser gesture takeover, tab switch mid-drag) must not
+// leave the drag session dangling — otherwise annotations chase the pointer.
+els.viewerWrap.addEventListener('pointercancel', () => {
+  if (!drag) return;
+  drag = null;
+  els.viewerWrap.classList.remove('panning');
+  clearDragPreview();
 });
 
 function applyResize(d, p) {
@@ -838,21 +881,28 @@ function clearDragPreview() {
 function applyTextMarkup() {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+  // geometric page lookup — elementFromPoint would drop any selection line
+  // scrolled outside the visible viewport
+  const pages = $$('#viewer .page').filter((el) => el._inv);
+  const pageAt = (cx, cy) => pages.find((el) => {
+    const r = el.getBoundingClientRect();
+    return cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+  });
   const perPage = new Map(); // pageId -> quads
   for (let r = 0; r < sel.rangeCount; r++) {
     const rects = sel.getRangeAt(r).getClientRects();
     for (const rect of rects) {
       if (rect.width < 1 || rect.height < 2) continue;
-      const centerEl = document.elementFromPoint(
-        clamp(rect.left + rect.width / 2, 0, window.innerWidth - 1),
-        clamp(rect.top + rect.height / 2, 0, window.innerHeight - 1));
-      const page = centerEl?.closest?.('.page');
-      if (!page || !page._inv) continue;
+      const page = pageAt(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (!page) continue;
       const pr = page.getBoundingClientRect();
       const p1 = applyMatrix(page._inv, rect.left - pr.left, rect.top - pr.top);
       const p2 = applyMatrix(page._inv, rect.right - pr.left, rect.bottom - pr.top);
       const q = normRect(p1.x, p1.y, p2.x, p2.y);
-      if (q.h > 60 || q.w < 0.5) continue; // block-level artifacts
+      // filter whole-block artifacts relative to the page, not a fixed 60pt —
+      // a 72pt headline is a perfectly highlightable line
+      const pageH = page._view ? page._view[3] - page._view[1] : 792;
+      if (q.h > pageH * 0.5 || q.w < 0.5) continue;
       const list = perPage.get(page.dataset.pageId) || [];
       // skip near-duplicates (nested span rects)
       if (!list.some((e) => Math.abs(e.x - q.x) < 1 && Math.abs(e.y - q.y) < 1 && Math.abs(e.w - q.w) < 2)) {
@@ -889,16 +939,22 @@ function closeInlineEditors(commit = true) {
   }
 }
 
-function openFreetextEditor(a, el) {
+function openFreetextEditor(a, el, { isNew = false } = {}) {
   closeInlineEditors();
   const m = el._matrix;
   const scale = Math.hypot(m.a, m.b) || 1;
+  const rotation = el._viewport?.rotation || 0;
   const p = applyMatrix(m, a.rect.x, a.rect.y);
   const ta = document.createElement('textarea');
   ta.className = 'freetext-edit';
   ta.value = a.text || '';
   ta.style.left = `${p.x}px`;
   ta.style.top = `${p.y}px`;
+  // on rotated pages the box must rotate with the page around its anchor
+  if (rotation % 360 !== 0) {
+    ta.style.transformOrigin = '0 0';
+    ta.style.transform = `rotate(${rotation}deg)`;
+  }
   ta.style.width = `${Math.max(60, a.rect.w * scale)}px`;
   ta.style.height = `${Math.max(24, a.rect.h * scale)}px`;
   ta.style.fontSize = `${(a.fontSize || 14) * scale}px`;
@@ -917,15 +973,19 @@ function openFreetextEditor(a, el) {
     const wPx = parseFloat(ta.style.width);
     ta.remove();
     if (!doCommit || !text.trim()) {
-      // drop annotations that end up empty
-      store.state.annotations = store.state.annotations.filter((x) => x.id !== a.id);
-      store.emit({ type: 'annots', pageId: a.pageId });
+      if (isNew) {
+        // brand-new empty box: remove it and the undo entry its creation pushed
+        store.removeAnnotationSilently(a.id);
+        store.popUndo();
+      } else if (!text.trim()) {
+        store.deleteAnnotation(a.id); // deliberate clearing of an existing box
+      }
       return;
     }
-    store.updateAnnotation(a.id, {
-      text,
-      rect: { ...a.rect, w: wPx / scale, h: hPx / scale },
-    }, { skipUndo: true });
+    const patch = { text, rect: { ...a.rect, w: wPx / scale, h: hPx / scale } };
+    // a new annotation's creation already holds the undo entry; edits to an
+    // existing one get their own
+    store.updateAnnotation(a.id, patch, { skipUndo: isNew || text === (a.text || '') });
   };
   inlineEditor = { commit };
   ta.addEventListener('blur', () => closeInlineEditors(true));
@@ -936,7 +996,7 @@ function openFreetextEditor(a, el) {
   ta.addEventListener('pointerdown', (e) => e.stopPropagation());
 }
 
-function openNoteEditor(a, el) {
+function openNoteEditor(a, el, { isNew = false } = {}) {
   closeInlineEditors();
   const m = el._matrix;
   const p = applyMatrix(m, a.x + 24, a.y);
@@ -957,13 +1017,12 @@ function openNoteEditor(a, el) {
   const commit = (doCommit) => {
     const text = ta.value;
     box.remove();
-    if (doCommit) {
-      if (!text.trim() && !(a.text || '').trim()) {
-        store.state.annotations = store.state.annotations.filter((x) => x.id !== a.id);
-        store.emit({ type: 'annots', pageId: a.pageId });
-      } else {
-        store.updateAnnotation(a.id, { text }, { skipUndo: true });
-      }
+    if (!doCommit) return;
+    if (!text.trim() && isNew) {
+      store.removeAnnotationSilently(a.id);
+      store.popUndo();
+    } else if (text !== (a.text || '')) {
+      store.updateAnnotation(a.id, { text }, { skipUndo: isNew });
     }
   };
   inlineEditor = { commit };
@@ -1169,18 +1228,38 @@ $('#imageInput').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   e.target.value = '';
   if (!file) return;
-  const dataUrl = await new Promise((res) => {
-    const fr = new FileReader();
-    fr.onload = () => res(fr.result);
-    fr.readAsDataURL(file);
-  });
-  const img = new Image();
-  img.onload = () => {
-    view.pending = { kind: 'image', dataUrl, w: img.width, h: img.height };
+  try {
+    const dataUrl = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = () => rej(new Error('could not read image'));
+      fr.readAsDataURL(file);
+    });
+    const img = await loadImage(dataUrl);
+    // pdf-lib can only embed PNG/JPEG — re-encode anything else (WebP…) now,
+    // otherwise the image would silently vanish from the saved file
+    let finalUrl = dataUrl;
+    if (!/^data:image\/(png|jpeg)/.test(dataUrl)) {
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      c.getContext('2d').drawImage(img, 0, 0);
+      finalUrl = c.toDataURL('image/png');
+    }
+    view.pending = { kind: 'image', dataUrl: finalUrl, w: img.naturalWidth, h: img.naturalHeight };
     toast('Click on the page to place the image');
-  };
-  img.src = dataUrl;
+  } catch (err) {
+    toast(`Could not load image: ${err.message}`, true);
+  }
 });
+
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = () => rej(new Error('unsupported or corrupt image'));
+    img.src = src;
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Search
@@ -1196,20 +1275,26 @@ async function extractedFor(entry) {
   return view.textCache.get(key);
 }
 
+let searchGen = 0; // discard results of a superseded query mid-flight
+
 const runSearch = debounce(async () => {
+  const gen = ++searchGen;
   const q = $('#searchInput').value.trim();
-  view.search.query = q;
-  view.search.results = [];
-  view.search.current = -1;
+  const results = [];
   if (q.length >= 2) {
     for (let i = 0; i < store.state.pages.length; i++) {
       const entry = store.state.pages[i];
       const ext = await extractedFor(entry);
+      if (gen !== searchGen) return; // a newer query took over
       const matches = findMatches(ext, q);
-      for (const m of matches) view.search.results.push({ pageIndex: i, pageId: entry.id, rects: m.rects });
+      for (const m of matches) results.push({ pageIndex: i, pageId: entry.id, rects: m.rects });
     }
   }
-  if (view.search.results.length) gotoMatch(0);
+  if (gen !== searchGen) return;
+  view.search.query = q;
+  view.search.results = results;
+  view.search.current = -1;
+  if (results.length) gotoMatch(0);
   else {
     $('#searchCount').textContent = q.length >= 2 ? '0 results' : '';
     $$('#viewer .searchLayer').forEach((l) => { l.textContent = ''; });
@@ -1260,10 +1345,7 @@ function toggleSearch(show) {
   const bar = $('#searchbar');
   bar.hidden = show === undefined ? !bar.hidden : !show;
   if (!bar.hidden) $('#searchInput').focus();
-  else {
-    view.search = { query: '', results: [], current: -1 };
-    $$('#viewer .searchLayer').forEach((l) => { l.textContent = ''; });
-  }
+  else clearSearchResults();
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,7 +1392,7 @@ function renderOrganizer() {
     div.addEventListener('dragstart', (e) => {
       if (!orgSel.has(entry.id)) { orgSel.clear(); orgSel.add(entry.id); }
       e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', 'pages');
+      e.dataTransfer.setData('text/plain', 'mirrorz-pages');
     });
     div.addEventListener('dragover', (e) => {
       e.preventDefault();
@@ -1326,6 +1408,8 @@ function renderOrganizer() {
       e.preventDefault();
       const before = div.classList.contains('drag-over-before');
       div.classList.remove('drag-over-before', 'drag-over-after');
+      // ignore drags that didn't start from our own page grid (files, text…)
+      if (e.dataTransfer.getData('text/plain') !== 'mirrorz-pages') return;
       const ids = [...orgSel];
       const rest = store.state.pages.filter((p) => !ids.includes(p.id));
       let target = rest.findIndex((p) => p.id === entry.id);
@@ -1409,15 +1493,19 @@ async function saveDocument(mode) {
   }
 }
 
+let lastPrintUrl = null;
+
 async function printDocument() {
   if (!store.hasDocument) return;
   try {
     toast('Preparing print copy…');
     const bytes = await exportPdf(store, { mode: 'annots' });
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
-    const win = window.open(url);
+    // keep the URL alive for the print tab's lifetime (reload, delayed open);
+    // only reclaim the previous one
+    if (lastPrintUrl) URL.revokeObjectURL(lastPrintUrl);
+    lastPrintUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    const win = window.open(lastPrintUrl);
     if (!win) toast('Pop-up blocked — allow pop-ups to print', true);
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
   } catch (err) { toast(`Print failed: ${err.message}`, true); }
 }
 
@@ -1606,8 +1694,13 @@ async function renderRecents() {
       const li = document.createElement('li');
       li.innerHTML = `<span>${escapeHtml(rec.name)}</span><span class="muted">${formatBytes(rec.size)}</span>`;
       li.addEventListener('click', async () => {
-        await addDocument(new Uint8Array(rec.bytes), rec.name, { fresh: true });
-        await afterCompositionChange({ fresh: true });
+        try {
+          await addDocument(new Uint8Array(rec.bytes), rec.name, { fresh: true });
+          await afterCompositionChange({ fresh: true });
+        } catch (err) {
+          console.error(err);
+          toast(`Could not reopen ${rec.name}: ${err.message}`, true);
+        }
       });
       ul.appendChild(li);
     }
@@ -1683,10 +1776,17 @@ function wireToolbar() {
   });
 
   // properties
+  // the color input fires 'input' continuously while dragging the picker —
+  // push one undo entry per interaction, not one per frame
+  let colorUndoPushed = false;
   $('#propColor').addEventListener('input', (e) => {
     view.props.color = e.target.value;
-    if (view.selected) applyPropToSelection({ color: e.target.value });
+    if (view.selected) {
+      if (!colorUndoPushed) { store.pushUndo(); colorUndoPushed = true; }
+      store.updateAnnotation(view.selected, { color: e.target.value }, { skipUndo: true });
+    }
   });
+  $('#propColor').addEventListener('change', () => { colorUndoPushed = false; });
   $('#propWidth').addEventListener('change', (e) => {
     view.props.width = Number(e.target.value);
     if (view.selected) applyPropToSelection({ strokeWidth: Number(e.target.value) });
@@ -1759,18 +1859,21 @@ const TOOL_KEYS = {
 };
 
 document.addEventListener('keydown', (evt) => {
+  const dialogOpen = !!document.querySelector('dialog[open]');
   const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '')
-    || document.querySelector('dialog[open]');
+    || dialogOpen;
   const mod = evt.ctrlKey || evt.metaKey;
 
   if (mod) {
+    if (dialogOpen) return; // dialogs keep their own Ctrl-key behavior
     const key = evt.key.toLowerCase();
     if (key === 'o') { evt.preventDefault(); $('#fileInput').click(); }
     else if (key === 's') { evt.preventDefault(); saveDocument('annots'); }
     else if (key === 'p') { evt.preventDefault(); printDocument(); }
     else if (key === 'f') { evt.preventDefault(); toggleSearch(true); }
-    else if (key === 'z' && !inField) { evt.preventDefault(); evt.shiftKey ? store.redo() : store.undo(); }
-    else if (key === 'y' && !inField) { evt.preventDefault(); store.redo(); }
+    // undo/redo during an active drag would corrupt the drag's history entry
+    else if (key === 'z' && !inField && !drag) { evt.preventDefault(); evt.shiftKey ? store.redo() : store.undo(); }
+    else if (key === 'y' && !inField && !drag) { evt.preventDefault(); store.redo(); }
     return;
   }
   if (inField) return;

@@ -2,8 +2,8 @@
 // app. Exported bytes are re-parsed with pdf-lib and pdf.js to prove that
 // annotations, forms, page ops, watermarks and metadata really land in the file.
 import { describe, it, expect, beforeAll } from 'vitest';
-import { PDFDocument, PDFName, PDFDict, PDFArray, PDFRef } from 'pdf-lib';
-import { exportPdf, stripManagedAnnotations, importAnnotations, listFormFields, fileToPdfBytes } from '../../src/pdfio.js';
+import { PDFDocument, PDFName, PDFDict, PDFArray, PDFRef, StandardFonts } from 'pdf-lib';
+import { exportPdf, stripManagedAnnotations, importAnnotations, listFormFields, fileToPdfBytes, FORM_KEY_SEP } from '../../src/pdfio.js';
 import { makeSamplePdf, makeFormPdf, makeAnnotatedPdf } from '../fixtures/make-fixtures.mjs';
 
 // pdf.js legacy build works in Node (no DOM needed for parsing/text)
@@ -293,5 +293,113 @@ describe('file conversion', () => {
   it('rejects unsupported types', async () => {
     const file = new File([new Uint8Array(4)], 'x.exe', { type: 'application/octet-stream' });
     await expect(fileToPdfBytes(file)).rejects.toThrow(/Unsupported/);
+  });
+});
+
+describe('regressions from adversarial review', () => {
+  it('line/arrow direction survives export -> import in all four quadrants', async () => {
+    const store = makeStore(sampleBytes);
+    // four arrows/lines, one per screen-direction quadrant, head at (x2, y2)
+    store.state.annotations = [
+      { id: 'q1', pageId: 'p0', type: 'arrow', x1: 100, y1: 100, x2: 200, y2: 200, color: '#000000', opacity: 1, strokeWidth: 2 },
+      { id: 'q2', pageId: 'p0', type: 'arrow', x1: 300, y1: 200, x2: 250, y2: 150, color: '#000000', opacity: 1, strokeWidth: 2 },
+      { id: 'q3', pageId: 'p0', type: 'arrow', x1: 100, y1: 400, x2: 200, y2: 350, color: '#000000', opacity: 1, strokeWidth: 2 },
+      { id: 'q4', pageId: 'p0', type: 'line', x1: 300, y1: 350, x2: 250, y2: 420, color: '#000000', opacity: 1, strokeWidth: 2 },
+    ];
+    const bytes = await exportPdf(store, { mode: 'annots' });
+    const pdf = await loadPdfjs(bytes);
+    const imported = await importAnnotations(pdf, ['p0', 'p1', 'p2'], bytes);
+    const lines = imported.filter((a) => a.type === 'arrow' || a.type === 'line');
+    expect(lines).toHaveLength(4);
+    for (const orig of store.state.annotations) {
+      const match = lines.find((l) =>
+        Math.abs(l.x1 - orig.x1) < 1 && Math.abs(l.y1 - orig.y1) < 1 &&
+        Math.abs(l.x2 - orig.x2) < 1 && Math.abs(l.y2 - orig.y2) < 1 &&
+        l.type === orig.type);
+      expect(match, `direction lost for ${orig.id} (${orig.x1},${orig.y1})->(${orig.x2},${orig.y2})`).toBeTruthy();
+    }
+  });
+
+  it('strips only the annotations that were imported (by ref), keeping the rest', async () => {
+    const pdf = await loadPdfjs(annotatedBytes);
+    const imported = await importAnnotations(pdf, ['x0'], annotatedBytes);
+    expect(imported).toHaveLength(1);
+    // empty ref set: nothing may be removed
+    const untouched = await stripManagedAnnotations(annotatedBytes, new Set());
+    expect(pageAnnots(await PDFDocument.load(untouched), 0)).toHaveLength(1);
+    // the imported refs: exactly that annotation goes away
+    const refSet = new Set(imported.map((a) => a.srcRef));
+    const cleaned = await stripManagedAnnotations(annotatedBytes, refSet);
+    expect(pageAnnots(await PDFDocument.load(cleaned), 0)).toHaveLength(0);
+  });
+
+  it('anchors watermark and page numbers to the crop box, not the media box', async () => {
+    // a page whose CropBox is offset from its MediaBox
+    const src = await PDFDocument.create();
+    const font = await src.embedFont(StandardFonts.Helvetica);
+    const page = src.addPage([612, 1000]);
+    page.setCropBox(0, 208, 612, 792);
+    page.drawText('crop test', { x: 72, y: 900, size: 12, font });
+    const srcBytes = await src.save();
+
+    const store = makeStore(srcBytes, 1);
+    store.watermark = { text: 'DRAFT', size: 48, opacity: 0.3, color: '#d63031', diagonal: false, pagenums: true };
+    const bytes = await exportPdf(store, { mode: 'annots' });
+    const pdf = await loadPdfjs(bytes);
+    const items = (await (await pdf.getPage(1)).getTextContent()).items;
+    const wmItem = items.find((i) => i.str === 'DRAFT');
+    const pnItem = items.find((i) => i.str.includes('1 / 1'));
+    expect(wmItem).toBeTruthy();
+    expect(pnItem).toBeTruthy();
+    // watermark must center on the crop box (visible center y=604), not the
+    // media box (y=500)
+    expect(wmItem.transform[5]).toBeGreaterThan(550);
+    // page number must sit inside the crop box (above y=208), not clipped below
+    expect(pnItem.transform[5]).toBeGreaterThan(208);
+    expect(pnItem.transform[5]).toBeLessThan(240);
+  });
+
+  it('scopes form values per merged source document', async () => {
+    const store = makeStore(formBytes, 1, 'dA');
+    store.sources.set('dB', { bytes: formBytes, name: 'copy.pdf', pdf: null });
+    store.state.pages.push({ id: 'pB', docId: 'dB', srcIndex: 0, rotation: 0 });
+    store.formValues = {
+      [`dA${FORM_KEY_SEP}applicant.name`]: 'Alice',
+      [`dB${FORM_KEY_SEP}applicant.name`]: 'Bob',
+    };
+    const bytes = await exportPdf(store, { mode: 'flatten' });
+    const pdf = await loadPdfjs(bytes);
+    const t1 = (await (await pdf.getPage(1)).getTextContent()).items.map((i) => i.str).join(' ');
+    const t2 = (await (await pdf.getPage(2)).getTextContent()).items.map((i) => i.str).join(' ');
+    expect(t1).toContain('Alice');
+    expect(t1).not.toContain('Bob');
+    expect(t2).toContain('Bob');
+  });
+
+  it('watermark text with non-WinAnsi characters does not throw', async () => {
+    const store = makeStore(sampleBytes);
+    store.watermark = { text: 'DRAFT — 草稿 “quote” €', size: 48, opacity: 0.2, color: '#d63031', diagonal: true, pagenums: false };
+    const bytes = await exportPdf(store, { mode: 'annots' });
+    const pdf = await loadPdfjs(bytes);
+    const text = (await (await pdf.getPage(1)).getTextContent()).items.map((i) => i.str).join(' ');
+    expect(text).toContain('DRAFT');
+    expect(text).toContain('€'); // WinAnsi CAN encode the euro sign
+  });
+
+  it('freetext with long unbreakable words and CR line endings exports every character', async () => {
+    const store = makeStore(sampleBytes);
+    const longWord = 'A'.repeat(120);
+    store.state.annotations = [{
+      id: 'ft', pageId: 'p0', type: 'freetext',
+      rect: { x: 60, y: 60, w: 150, h: 300 },
+      text: `first\rsecond\r\n${longWord}`, fontSize: 12, color: '#000000', opacity: 1,
+    }];
+    const bytes = await exportPdf(store, { mode: 'flatten' });
+    const pdf = await loadPdfjs(bytes);
+    const text = (await (await pdf.getPage(1)).getTextContent()).items.map((i) => i.str).join('');
+    expect(text).toContain('first');
+    expect(text).toContain('second');
+    expect(text).not.toContain('?'); // CR must split lines, never corrupt them
+    expect((text.match(/A/g) || []).length).toBeGreaterThanOrEqual(120);
   });
 });

@@ -113,3 +113,53 @@ describe('Store annotations & history', () => {
     expect(store.undoStack.length).toBeLessThanOrEqual(60);
   });
 });
+
+describe('regressions from adversarial review', () => {
+  it('interns image dataURLs in undo snapshots instead of duplicating them', () => {
+    const store = makeStore(1);
+    const pid = store.state.pages[0].id;
+    const bigImage = 'data:image/png;base64,' + 'x'.repeat(50000);
+    const a = store.addAnnotation({
+      pageId: pid, type: 'stamp', rect: { x: 0, y: 0, w: 40, h: 40 }, imageData: bigImage,
+    });
+    // several more mutations -> several snapshots that reference the image
+    for (let i = 0; i < 5; i++) store.updateAnnotation(a.id, { opacity: 1 - i * 0.1 });
+    const totalSnapshotSize = store.undoStack.reduce((n, s) => n + s.length, 0);
+    expect(totalSnapshotSize).toBeLessThan(bigImage.length * 2); // not 5 copies
+    expect(store.imagePool.size).toBe(1);
+    // and undo restores the real image, not the pool token
+    store.undo();
+    store.redo();
+    const restored = store.state.annotations.find((x) => x.id === a.id);
+    expect(restored.imageData).toBe(bigImage);
+  });
+
+  it('removeAnnotationSilently + popUndo leaves history untouched', () => {
+    const store = makeStore(1);
+    const pid = store.state.pages[0].id;
+    const before = store.undoStack.length;
+    const a = store.addAnnotation({ pageId: pid, type: 'note', x: 1, y: 1, text: '' });
+    store.removeAnnotationSilently(a.id);
+    store.popUndo();
+    expect(store.undoStack.length).toBe(before);
+    expect(store.state.annotations).toHaveLength(0);
+  });
+
+  it('deletePages guard ignores stale ids', () => {
+    const store = makeStore(3);
+    const [a, b, c] = store.state.pages.map((p) => p.id);
+    // stale/duplicate ids must not trick the keep-one guard
+    expect(store.deletePages([a, b, 'stale-1', 'stale-2'])).toBe(true);
+    expect(store.state.pages.map((p) => p.id)).toEqual([c]);
+    expect(store.deletePages([c, 'stale-3'])).toBe(false);
+  });
+
+  it('formValues is prototype-pollution safe', () => {
+    const store = makeStore(1);
+    store.formValues['__proto__'] = 'evil';
+    store.formValues['toString'] = 'also evil';
+    expect(Object.prototype.toString).toBeInstanceOf(Function);
+    expect(store.formValues['__proto__']).toBe('evil');
+    expect(({}).evil).toBeUndefined();
+  });
+});

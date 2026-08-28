@@ -119,11 +119,22 @@ export async function extractPageText(page) {
  * Find matches of `query` in extracted page text; returns rects in PDF user
  * space (y-up) covering each match (approximated per text item).
  */
+/** Lowercase without changing string length (e.g. 'İ' lowercases to 2 chars,
+ * which would misalign match offsets against item.start positions). */
+function foldCase(s) {
+  let out = '';
+  for (const ch of s) {
+    const low = ch.toLowerCase();
+    out += low.length === ch.length ? low : ch;
+  }
+  return out;
+}
+
 export function findMatches(extracted, query) {
   // newlines separate items visually but not semantically — treat as spaces
-  const q = query.toLowerCase().replace(/\n/g, ' ');
+  const q = foldCase(query).replace(/\n/g, ' ');
   if (!q) return [];
-  const hay = extracted.text.toLowerCase().replace(/\n/g, ' ');
+  const hay = foldCase(extracted.text).replace(/\n/g, ' ');
   const matches = [];
   let idx = 0;
   while ((idx = hay.indexOf(q, idx)) !== -1) {

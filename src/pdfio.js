@@ -16,6 +16,9 @@ const MANAGED_SUBTYPES = new Set([
   'FreeText', 'Text',
 ]);
 
+/** Separator for form-value keys scoped to one merged source: `docId\0field`. */
+export const FORM_KEY_SEP = '\u0000';
+
 const n2 = (v) => String(Math.round(v * 100) / 100);
 
 // ---------------------------------------------------------------------------
@@ -98,9 +101,18 @@ function wrapLine(line, font, size, maxWidth) {
   const words = line.split(/(\s+)/);
   const out = [];
   let cur = '';
-  for (const w of words) {
+  const width = (s) => font.widthOfTextAtSize(s, size);
+  for (let w of words) {
+    // hard-break a single token wider than the box so nothing is clipped away
+    while (w && width(w) > maxWidth) {
+      if (cur.trim()) { out.push(cur.trimEnd()); cur = ''; }
+      let cut = w.length;
+      while (cut > 1 && width(w.slice(0, cut)) > maxWidth) cut--;
+      out.push(w.slice(0, cut));
+      w = w.slice(cut);
+    }
     const candidate = cur + w;
-    if (cur && font.widthOfTextAtSize(candidate, size) > maxWidth) {
+    if (cur && width(candidate) > maxWidth) {
       out.push(cur.trimEnd());
       cur = w.trimStart();
     } else {
@@ -111,9 +123,15 @@ function wrapLine(line, font, size, maxWidth) {
   return out;
 }
 
+// Typographic characters WinAnsi actually encodes (curly quotes, dashes, €, …)
+const WINANSI_EXTRA = '€‚ƒ„…†‡ˆ‰Š' +
+  '‹ŒŽ‘’“”•–—˜™š' +
+  '›œžŸ';
+const NON_WINANSI = new RegExp(`[^\\x20-\\x7e\\xa0-\\xff${WINANSI_EXTRA}]`, 'g');
+
 /** Replace characters Helvetica/WinAnsi can't encode. */
 function sanitizeWinAnsi(s) {
-  return String(s).replace(/\t/g, '    ').replace(/[^\x20-\x7e\xa0-\xff]/g, '?');
+  return String(s).replace(/\t/g, '    ').replace(NON_WINANSI, '?');
 }
 
 function dataUrlToBytes(dataUrl) {
@@ -131,24 +149,97 @@ function dataUrlToBytes(dataUrl) {
 /**
  * Read the markup annotations of an already-loaded pdf.js document and map
  * them into MIRRORZ model annotations (page space, y-down from crop box top).
+ * Each imported annotation records `srcRef` (the source object ref, pdf.js id
+ * format like "12R") so stripManagedAnnotations removes exactly these and
+ * nothing else.
  * @param pdfjsDoc pdf.js PDFDocumentProxy
  * @param pageIds our page ids, index-aligned with the document's pages
+ * @param bytes the document bytes — used to read raw /L and /LE for Line
+ *   annotations (pdf.js normalizes /L, destroying line direction)
  */
-export async function importAnnotations(pdfjsDoc, pageIds) {
+export async function importAnnotations(pdfjsDoc, pageIds, bytes = null) {
   const annots = [];
+  const views = [];
   for (let i = 1; i <= pdfjsDoc.numPages; i++) {
     const page = await pdfjsDoc.getPage(i);
     const view = page.view; // [x1, y1, x2, y2] user space
+    views[i - 1] = view;
     const toPS = (ux, uy) => ({ x: ux - view[0], y: view[3] - uy });
     const list = await page.getAnnotations().catch(() => []);
     for (const a of list) {
       if (!a.subtype || !MANAGED_SUBTYPES.has(a.subtype)) continue;
       if (a.annotationFlags & 2) continue; // hidden
+      if (!a.id) continue; // no object ref -> we couldn't strip it -> leave it baked
       const mapped = mapPdfjsAnnotation(a, toPS);
-      if (mapped) annots.push({ id: uid('a'), pageId: pageIds[i - 1], ...mapped });
+      if (mapped) {
+        annots.push({ id: uid('a'), pageId: pageIds[i - 1], srcRef: a.id, pageIdx: i - 1, ...mapped });
+      }
     }
   }
+  // pdf.js normalizes /L per-axis (Util.normalizeRect), which mirrors lines and
+  // arrows in 3 of 4 orientations — recover the raw endpoints from the bytes.
+  if (bytes && annots.some((a) => a.type === 'line' || a.type === 'arrow')) {
+    try {
+      const rawLines = await harvestLineGeometry(bytes);
+      for (const a of annots) {
+        if (a.type !== 'line' && a.type !== 'arrow') continue;
+        const raw = rawLines.get(a.srcRef);
+        if (!raw || raw.L.length < 4) continue;
+        const view = views[a.pageIdx];
+        const toPS = (ux, uy) => ({ x: ux - view[0], y: view[3] - uy });
+        let p1 = toPS(raw.L[0], raw.L[1]);
+        let p2 = toPS(raw.L[2], raw.L[3]);
+        const arrowAt1 = /Arrow/.test(raw.LE[0] || '');
+        const arrowAt2 = /Arrow/.test(raw.LE[1] || '');
+        if (arrowAt1 && !arrowAt2) [p1, p2] = [p2, p1]; // model keeps the head at p2
+        a.type = arrowAt1 || arrowAt2 ? 'arrow' : 'line';
+        a.x1 = p1.x; a.y1 = p1.y; a.x2 = p2.x; a.y2 = p2.y;
+      }
+    } catch { /* keep pdf.js geometry if the raw pass fails */ }
+  }
+  for (const a of annots) delete a.pageIdx;
   return annots;
+}
+
+/** Raw /L and /LE per Line annotation, keyed by pdf.js-style ref id ("12R"). */
+async function harvestLineGeometry(bytes) {
+  const map = new Map();
+  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+  const ctx = doc.context;
+  const subtypeName = PDFName.of('Subtype');
+  for (const page of doc.getPages()) {
+    const pageAnnots = page.node.Annots?.();
+    if (!pageAnnots) continue;
+    for (let i = 0; i < pageAnnots.size(); i++) {
+      const ref = pageAnnots.get(i);
+      if (!(ref instanceof PDFRef)) continue;
+      const dict = ctx.lookup(ref);
+      if (!(dict instanceof PDFDict)) continue;
+      if (dict.get(subtypeName)?.toString() !== '/Line') continue;
+      const L = [];
+      const lArr = ctx.lookup(dict.get(PDFName.of('L')));
+      if (lArr?.size) {
+        for (let k = 0; k < lArr.size(); k++) {
+          const num = ctx.lookup(lArr.get(k));
+          L.push(Number(num?.asNumber?.() ?? num?.numberValue ?? NaN));
+        }
+      }
+      const LE = [];
+      const leArr = ctx.lookup(dict.get(PDFName.of('LE')));
+      if (leArr?.size) {
+        for (let k = 0; k < leArr.size(); k++) {
+          LE.push(ctx.lookup(leArr.get(k))?.toString() || '');
+        }
+      }
+      map.set(refKey(ref), { L, LE });
+    }
+  }
+  return map;
+}
+
+/** pdf.js annotation id format for a pdf-lib ref: "12R" / "12R1". */
+function refKey(ref) {
+  return `${ref.objectNumber}R${ref.generationNumber ? ref.generationNumber : ''}`;
 }
 
 function mapPdfjsAnnotation(a, toPS) {
@@ -253,11 +344,14 @@ function parseInkLists(lists, toPS) {
 }
 
 /**
- * Remove the annotation subtypes we manage from the PDF bytes (they now live
- * in the editable model instead). Links, widgets, stamps etc. are preserved.
+ * Remove managed annotations from the PDF bytes (they now live in the editable
+ * model instead). When `refKeys` (a Set of pdf.js-style ids like "12R") is
+ * given, ONLY those annotations are removed — hidden or unmappable ones that
+ * were never imported stay in the file instead of being silently destroyed.
+ * Links, widgets, stamps etc. are always preserved.
  * Returns null if the bytes could not be processed (e.g. encrypted).
  */
-export async function stripManagedAnnotations(bytes) {
+export async function stripManagedAnnotations(bytes, refKeys = null) {
   let doc;
   try {
     doc = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
@@ -267,17 +361,25 @@ export async function stripManagedAnnotations(bytes) {
   const ctx = doc.context;
   const subtypeName = PDFName.of('Subtype');
   const parentName = PDFName.of('Parent');
-  const isManaged = (dict) => {
+  const isManagedSubtype = (dict) => {
+    const st = dict?.get?.(subtypeName);
+    return !!st && MANAGED_SUBTYPES.has(st.toString().slice(1));
+  };
+  const shouldStrip = (value, dict) => {
     const st = dict?.get?.(subtypeName);
     if (!st) return false;
     const s = st.toString().slice(1);
-    if (MANAGED_SUBTYPES.has(s)) return true;
     if (s === 'Popup') {
-      const parent = ctx.lookup(dict.get(parentName));
-      const pst = parent?.get?.(subtypeName);
-      return !!pst && MANAGED_SUBTYPES.has(pst.toString().slice(1));
+      // strip a popup iff its parent markup annotation is being stripped
+      const parentRef = dict.get(parentName);
+      const parent = ctx.lookup(parentRef);
+      if (!isManagedSubtype(parent)) return false;
+      if (!refKeys) return true;
+      return parentRef instanceof PDFRef && refKeys.has(refKey(parentRef));
     }
-    return false;
+    if (!MANAGED_SUBTYPES.has(s)) return false;
+    if (!refKeys) return true;
+    return value instanceof PDFRef && refKeys.has(refKey(value));
   };
   for (const page of doc.getPages()) {
     const annots = page.node.Annots?.();
@@ -286,7 +388,7 @@ export async function stripManagedAnnotations(bytes) {
     for (let i = 0; i < annots.size(); i++) {
       const value = annots.get(i);
       const dict = ctx.lookup(value);
-      if (!(dict instanceof PDFDict) || !isManaged(dict)) kept.push(value);
+      if (!(dict instanceof PDFDict) || !shouldStrip(value, dict)) kept.push(value);
     }
     page.node.set(PDFName.of('Annots'), ctx.obj(kept));
   }
@@ -327,15 +429,23 @@ export async function listFormFields(bytes) {
   return out;
 }
 
-function applyFormValues(doc, values, helv, { flatten = false } = {}) {
+function applyFormValues(doc, values, helv, { flatten = false, docId = null } = {}) {
   let form;
   try { form = doc.getForm(); } catch { return; }
   let touched = false;
-  for (const [name, value] of Object.entries(values || {})) {
+  for (const [key, value] of Object.entries(values || {})) {
+    // keys are "docId\0fieldName" (scoped to one source of a merge) or a bare
+    // field name (applies to every source)
+    let name = key;
+    const sep = key.indexOf('\u0000');
+    if (sep >= 0) {
+      if (docId !== null && key.slice(0, sep) !== docId) continue;
+      name = key.slice(sep + 1);
+    }
     let field;
     try { field = form.getField(name); } catch { continue; }
     try {
-      if (field instanceof PDFTextField) field.setText(String(value ?? ''));
+      if (field instanceof PDFTextField) field.setText(sanitizeWinAnsi(String(value ?? '')));
       else if (field instanceof PDFCheckBox) (value ? field.check() : field.uncheck());
       else if (field instanceof PDFRadioGroup) { if (value) field.select(String(value)); }
       else if (field instanceof PDFDropdown || field instanceof PDFOptionList) {
@@ -415,13 +525,32 @@ export async function exportPdf(store, opts = {}) {
     if (p.docId === null || srcCache.has(p.docId)) continue;
     const src = store.sources.get(p.docId);
     const doc = await PDFDocument.load(src.bytes, { ignoreEncryption: true, updateMetadata: false });
+    if (doc.isEncrypted) {
+      // pdf-lib cannot decrypt: copying pages would emit ciphertext without an
+      // /Encrypt dict — a corrupted file. Fail loudly instead of saving garbage.
+      throw new Error(
+        `"${src.name}" is password-protected. MIRRORZ can view it, but saving ` +
+        'encrypted files is not supported yet — export an unprotected copy first.');
+    }
     const srcHelv = await doc.embedFont(StandardFonts.Helvetica);
     try { anyForms = anyForms || doc.getForm().getFields().length > 0; } catch { /* no form */ }
-    applyFormValues(doc, store.formValues, srcHelv, { flatten: mode === 'flatten' });
+    applyFormValues(doc, store.formValues, srcHelv, { flatten: mode === 'flatten', docId: p.docId });
     srcCache.set(p.docId, doc);
   }
 
-  // Assemble pages in order
+  // Copy pages per source in one batch (shared resources stay shared),
+  // then assemble in composition order
+  const copiedById = new Map();
+  const perSource = new Map();
+  for (const p of included) {
+    if (p.docId === null) continue;
+    if (!perSource.has(p.docId)) perSource.set(p.docId, []);
+    perSource.get(p.docId).push(p);
+  }
+  for (const [docId, entries] of perSource) {
+    const copies = await out.copyPages(srcCache.get(docId), entries.map((e) => e.srcIndex));
+    entries.forEach((e, i) => copiedById.set(e.id, copies[i]));
+  }
   const outPageById = new Map();
   for (const p of included) {
     if (p.docId === null) {
@@ -429,7 +558,7 @@ export async function exportPdf(store, opts = {}) {
       if (p.rotation) page.setRotation(degrees(p.rotation));
       outPageById.set(p.id, page);
     } else {
-      const [copied] = await out.copyPages(srcCache.get(p.docId), [p.srcIndex]);
+      const copied = copiedById.get(p.id);
       out.addPage(copied);
       if (p.rotation) {
         const cur = copied.getRotation().angle || 0;
@@ -446,8 +575,14 @@ export async function exportPdf(store, opts = {}) {
   const getImage = async (dataUrl) => {
     if (!imgCache.has(dataUrl)) {
       const bytes = dataUrlToBytes(dataUrl);
-      const img = dataUrl.startsWith('data:image/jpeg')
-        ? await out.embedJpg(bytes) : await out.embedPng(bytes);
+      let img;
+      if (dataUrl.startsWith('data:image/jpeg')) {
+        img = await out.embedJpg(bytes);
+      } else {
+        // try PNG, then JPEG (some data URLs carry a wrong MIME); anything the
+        // embedder can't decode surfaces as a loud error, never a silent drop
+        try { img = await out.embedPng(bytes); } catch { img = await out.embedJpg(bytes); }
+      }
       imgCache.set(dataUrl, img);
     }
     return imgCache.get(dataUrl);
@@ -487,13 +622,17 @@ export async function exportPdf(store, opts = {}) {
 // -------- geometry helpers (page space -> user space) --------
 
 function cropOf(page) {
+  const mb = page.getMediaBox();
   let cb;
   try { cb = page.getCropBox(); } catch { cb = null; }
-  if (!cb || !cb.width || !cb.height) {
-    const mb = page.getMediaBox();
-    cb = { x: mb.x, y: mb.y, width: mb.width, height: mb.height };
-  }
-  return cb;
+  if (!cb || !cb.width || !cb.height) return { ...mb };
+  // normalize + intersect with the media box, matching pdf.js's `view`
+  let x1 = Math.min(cb.x, cb.x + cb.width), x2 = Math.max(cb.x, cb.x + cb.width);
+  let y1 = Math.min(cb.y, cb.y + cb.height), y2 = Math.max(cb.y, cb.y + cb.height);
+  x1 = Math.max(x1, mb.x); y1 = Math.max(y1, mb.y);
+  x2 = Math.min(x2, mb.x + mb.width); y2 = Math.min(y2, mb.y + mb.height);
+  if (x2 <= x1 || y2 <= y1) return { ...mb };
+  return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
 }
 
 function makeConverters(page) {
@@ -558,7 +697,9 @@ async function writeAnnot(out, page, a, helv, getImage) {
           opsParts.push(`${n2(x1)} ${n2(yBot)} ${n2(x2 - x1)} ${n2(yTop - yBot)} re f`);
         } else {
           const th = Math.max(0.75, (yTop - yBot) * 0.055);
-          const ly = a.type === 'underline' ? yBot + th : (yBot + yTop) / 2 - th / 2;
+          // match the overlay/flatten placement exactly: underline occupies the
+          // bottom `th` of the quad
+          const ly = a.type === 'underline' ? yBot : (yBot + yTop) / 2 - th / 2;
           opsParts.push(`${n2(x1)} ${n2(ly)} ${n2(x2 - x1)} ${n2(th)} re f`);
         }
       }
@@ -689,7 +830,7 @@ async function writeAnnot(out, page, a, helv, getImage) {
       const x1 = ux(r.x), y2 = uy(r.y), x2 = ux(r.x + r.w), y1 = uy(r.y + r.h);
       const rect = [x1, y1, x2, y2];
       const lines = [];
-      for (const raw of String(a.text || '').split('\n')) {
+      for (const raw of String(a.text || '').split(/\r\n|\r|\n/)) {
         lines.push(...wrapLine(sanitizeWinAnsi(raw), helv, size, Math.max(10, r.w - 4)));
       }
       const leading = size * 1.18;
@@ -858,7 +999,7 @@ async function flattenAnnot(out, page, a, helv, getImage) {
     case 'freetext': {
       const size = a.fontSize || 14;
       const lines = [];
-      for (const raw of String(a.text || '').split('\n')) {
+      for (const raw of String(a.text || '').split(/\r\n|\r|\n/)) {
         lines.push(...wrapLine(sanitizeWinAnsi(raw), helv, size, Math.max(10, a.rect.w - 4)));
       }
       let y = uy(a.rect.y) - size;
@@ -916,17 +1057,22 @@ function drawWatermarks(out, helv, wm) {
   const color = hexToRgb01(wm.color || '#d63031');
   const col = rgb(color.r, color.g, color.b);
   const pages = out.getPages();
+  const text = wm.text ? sanitizeWinAnsi(wm.text) : '';
   pages.forEach((page, i) => {
-    const { width, height } = page.getSize();
-    const pageRot = page.getRotation().angle || 0;
-    if (wm.text) {
+    // anchor everything to the crop box (what viewers actually show), not the
+    // media box — they differ in origin and size in real-world files
+    const cb = cropOf(page);
+    const cx = cb.x + cb.width / 2;
+    const cy = cb.y + cb.height / 2;
+    const pageRot = ((page.getRotation().angle || 0) % 360 + 360) % 360;
+    if (text) {
       const size = Number(wm.size) || 48;
-      const tw = helv.widthOfTextAtSize(wm.text, size);
+      const tw = helv.widthOfTextAtSize(text, size);
       const angle = (wm.diagonal ? 45 : 0) + pageRot;
       const rad = (angle * Math.PI) / 180;
-      page.drawText(sanitizeWinAnsi(wm.text), {
-        x: width / 2 - (tw / 2) * Math.cos(rad) + (size / 2) * Math.sin(rad),
-        y: height / 2 - (tw / 2) * Math.sin(rad) - (size / 2) * Math.cos(rad),
+      page.drawText(text, {
+        x: cx - (tw / 2) * Math.cos(rad) + (size / 2) * Math.sin(rad),
+        y: cy - (tw / 2) * Math.sin(rad) - (size / 2) * Math.cos(rad),
         size, font: helv, color: col,
         opacity: Number(wm.opacity) || 0.2,
         rotate: degrees(angle),
@@ -934,9 +1080,23 @@ function drawWatermarks(out, helv, wm) {
     }
     if (wm.pagenums) {
       const label = `${i + 1} / ${pages.length}`;
-      const tw = helv.widthOfTextAtSize(label, 10);
+      const size = 10;
+      const tw = helv.widthOfTextAtSize(label, size);
+      const rad = (pageRot * Math.PI) / 180;
+      // baseline midpoint 24pt above the *viewed* bottom edge, compensating
+      // for the page's /Rotate so the label reads upright
+      let bx, by;
+      switch (pageRot) {
+        case 90: bx = cb.x + cb.width - 24; by = cy; break;
+        case 180: bx = cx; by = cb.y + cb.height - 24; break;
+        case 270: bx = cb.x + 24; by = cy; break;
+        default: bx = cx; by = cb.y + 24;
+      }
       page.drawText(label, {
-        x: width / 2 - tw / 2, y: 24, size: 10, font: helv, color: rgb(0.35, 0.35, 0.35),
+        x: bx - (tw / 2) * Math.cos(rad),
+        y: by - (tw / 2) * Math.sin(rad),
+        size, font: helv, color: rgb(0.35, 0.35, 0.35),
+        rotate: degrees(pageRot),
       });
     }
   });

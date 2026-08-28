@@ -41,9 +41,12 @@ export class Store {
     this.fileName = 'document.pdf';
     this.meta = null;       // {title, author, subject, keywords} override for save
     this.watermark = null;  // {text, size, opacity, color, diagonal, pagenums}
-    this.formValues = {};   // fieldName -> value (string|boolean)
+    // null prototype: field names like "__proto__" or "toString" are valid PDF
+    // form field names and must behave as plain keys
+    this.formValues = Object.create(null); // "docId\0field" (or bare field) -> value
     this.undoStack = [];
     this.redoStack = [];
+    this.imagePool = new Map(); // hash -> dataURL, so snapshots don't copy images
     this.dirty = false;
   }
 
@@ -51,8 +54,24 @@ export class Store {
   emit(evt) { for (const fn of this.listeners) fn(evt); }
 
   // ---------- snapshots / undo ----------
+  // Image dataURLs (signatures, stamps) can be multi-MB; interning them keeps
+  // the 60-deep undo stack from duplicating them in every snapshot.
   snapshot() {
-    return JSON.stringify(this.state);
+    return JSON.stringify(this.state, (key, value) => {
+      if (key === 'imageData' && typeof value === 'string' && value.length > 512) {
+        const h = poolHash(value);
+        if (!this.imagePool.has(h)) this.imagePool.set(h, value);
+        return `@@img:${h}`;
+      }
+      return value;
+    });
+  }
+
+  parseSnapshot(json) {
+    return JSON.parse(json, (key, value) =>
+      key === 'imageData' && typeof value === 'string' && value.startsWith('@@img:')
+        ? (this.imagePool.get(value.slice(6)) ?? value)
+        : value);
   }
 
   pushUndo() {
@@ -66,7 +85,7 @@ export class Store {
   undo() {
     if (!this.undoStack.length) return false;
     this.redoStack.push(this.snapshot());
-    this.state = JSON.parse(this.undoStack.pop());
+    this.state = this.parseSnapshot(this.undoStack.pop());
     this.emit({ type: 'restore' });
     return true;
   }
@@ -74,9 +93,15 @@ export class Store {
   redo() {
     if (!this.redoStack.length) return false;
     this.undoStack.push(this.snapshot());
-    this.state = JSON.parse(this.redoStack.pop());
+    this.state = this.parseSnapshot(this.redoStack.pop());
     this.emit({ type: 'restore' });
     return true;
+  }
+
+  /** Drop the most recent undo entry (e.g. a gesture that turned out to be a no-op). */
+  popUndo() {
+    this.undoStack.pop();
+    this.emit({ type: 'history' });
   }
 
   get canUndo() { return this.undoStack.length > 0; }
@@ -116,9 +141,10 @@ export class Store {
   }
 
   deletePages(pageIds) {
-    if (pageIds.length >= this.state.pages.length) return false; // keep at least one
+    const survivors = this.state.pages.filter((p) => !pageIds.includes(p.id));
+    if (!survivors.length) return false; // keep at least one page
     this.pushUndo();
-    this.state.pages = this.state.pages.filter((p) => !pageIds.includes(p.id));
+    this.state.pages = survivors;
     this.state.annotations = this.state.annotations.filter((a) => !pageIds.includes(a.pageId));
     this.emit({ type: 'pages' });
     return true;
@@ -169,9 +195,28 @@ export class Store {
     return true;
   }
 
+  /** Remove without touching history — for aborting empty just-created annotations. */
+  removeAnnotationSilently(id) {
+    const a = this.state.annotations.find((x) => x.id === id);
+    if (!a) return;
+    this.state.annotations = this.state.annotations.filter((x) => x.id !== id);
+    this.emit({ type: 'annots', pageId: a.pageId });
+  }
+
   annotationsForPage(pageId) {
     return this.state.annotations.filter((a) => a.pageId === pageId);
   }
 
   get hasDocument() { return this.state.pages.length > 0; }
+}
+
+/** Cheap content hash for the snapshot image pool (two djb2 passes + length). */
+function poolHash(s) {
+  let h1 = 5381, h2 = 52711;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = ((h1 * 33) ^ c) >>> 0;
+    h2 = ((h2 * 31) ^ c) >>> 0;
+  }
+  return `${s.length}-${h1.toString(36)}-${h2.toString(36)}`;
 }
